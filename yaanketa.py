@@ -8,10 +8,10 @@ from aiogram.fsm.state import StatesGroup, State
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, \
     CallbackQuery
 
+# Настройка логирования
 logging.basicConfig(level=logging.INFO)
 
 API_TOKEN = '8963003779:AAFbWjq890GQd3fngSo46rvpHyzRFdyi3Ds'
-
 AITUNNEL_API_KEY = 'sk-aitunnel-SyRxNmO45HRboKeVqaxZC3qBp8hCUNiF'
 AITUNNEL_URL_TEXT = "https://api.aitunnel.ru/v1/chat/completions"
 MODEL_TEXT = "deepseek-v4-flash"
@@ -19,6 +19,9 @@ MODEL_TEXT = "deepseek-v4-flash"
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher()
 router = Router()
+
+# База данных в ОЗУ. Теперь хранит списки всех выданных рекомендаций: {user_id: [ответ1, ответ2, ...]}
+user_history = {}
 
 
 class UserAnketa(StatesGroup):
@@ -31,7 +34,10 @@ class UserAnketa(StatesGroup):
 
 
 main_kb = ReplyKeyboardMarkup(
-    keyboard=[[KeyboardButton(text="📋 Начать анкетирование")]],
+    keyboard=[
+        [KeyboardButton(text="📋 Начать анкетирование")],
+        [KeyboardButton(text="📜 История рекомендаций")]
+    ],
     resize_keyboard=True
 )
 
@@ -53,12 +59,21 @@ difficulty_kb = InlineKeyboardMarkup(inline_keyboard=[
 ])
 
 
-# АСИНХРОННЫЙ МОДУЛЬ ИИ ОБРАБОТКИ (Написано исключительно ИИ)
+# Валидация от спама символами
+def is_invalid_input(text: str) -> bool:
+    if not text:
+        return True
+    words = text.split()
+    for word in words:
+        if len(word) > 25:
+            return True
+    if len(text) > 5 and len(set(text.replace(" ", ""))) == 1:
+        return True
+    return False
 
-# ИИ
-# Функция отправки параметров анкеты в продвинутую текстовую модель через aitunnel
-async def get_llm_recommendation(anketa_data: dict) -> str:
-    """Отправка собранной анкеты в ИИ для получения текстовых рекомендаций"""
+
+# Модуль ИИ запроса
+async def get_llm_recommendation(anketa_data: dict, is_retry: bool) -> str:
     headers = {
         "Authorization": f"Bearer {AITUNNEL_API_KEY}",
         "Content-Type": "application/json"
@@ -71,28 +86,31 @@ async def get_llm_recommendation(anketa_data: dict) -> str:
     format_act = anketa_data.get('format') or "Не указано"
     difficulty = anketa_data.get('difficulty') or "Не указано"
 
+    history_context = ""
+    if is_retry:
+        history_context = "ВАЖНО: Пользователь проходит этот тест повторно. Постарайся предложить новые, альтернативные идеи, которые отличаются от предыдущих.\n"
+
     full_prompt = (
         "Ты — продвинутый ИИ-эксперт по профориентации. "
-        "Изучи анкету пользователя и предложи 3 конкретных подходящих направления (кружки, секции или курсы). "
-        "ВАЖНО: Пиши обычным простым текстом, вообще никогда не используй символы звездочек для выделения слов! "
-        "Отвечай кратко, структурировано по пунктам, без лишней воды. Обращайся на 'ты'.\n\n"
-        f"Данные анкеты:\n"
-        f"- Интересы: {interests}\n"
-        f"- Любимые предметы: {subjects}\n"
-        f"- Цели: {goals}\n"
-        f"- Занятость: {employment}\n"
-        f"- Формат: {format_act}\n"
-        f"- Сложность: {difficulty}"
+        "Изучи анкету пользователя и предложи ровно 3 конкретных подходящих направления (кружки, секции или курсы).\n\n"
+        f"{history_context}"
+        "ТРЕБОВАНИЯ К ОФОРМЛЕНИЮ (ДИЗАЙН):\n"
+        "1. Пиши обычным простым текстом. ВООБЩЕ никогда не используй символы звездочек (*) для выделения слов!\n"
+        "2. Сделай ответ красивым: используй подходящие тематические эмодзи (смайлики) для каждого пункта.\n"
+        "3. Разделяй блоки понятными абзацами и списками, чтобы текст выглядел как удобное структурированное меню.\n"
+        "4. Отвечай кратко, емко и без лишней воды. Обращайся к пользователю на 'ты'.\n\n"
+        f"Данные анкеты пользователя:\n"
+        f"- Интересы и хобби: {interests}\n"
+        f"- Любимые предметы/курсы: {subjects}\n"
+        f"- Главные цели: {goals}\n"
+        f"- Доступная занятость: {employment}\n"
+        f"- Формат активности: {format_act}\n"
+        f"- Желаемая сложность: {difficulty}"
     )
 
     payload = {
         "model": MODEL_TEXT,
-        "messages": [
-            {
-                "role": "user",
-                "content": full_prompt
-            }
-        ],
+        "messages": [{"role": "user", "content": full_prompt}],
         "temperature": 0.7
     }
 
@@ -108,18 +126,40 @@ async def get_llm_recommendation(anketa_data: dict) -> str:
                     return "Не удалось сгенерировать ответ. Попробуйте еще раз чуть позже."
     except Exception as e:
         logging.error(f"Ошибка при запросе к LLM: {e}")
-        return "Произошла техническая ошибка при связи с ИИ-сервером."
+        return "Произошла technical-ошибка при связи с ИИ-сервером."
 
 
-
+# Хендлеры опроса
 @router.message(Command("start"))
 async def cmd_start(message: Message):
     await message.answer(
         f"Привет, {message.from_user.first_name}! Добро пожаловать в систему подбора образовательных треков! 🚀\n"
-        f"Пройди опрос из 6 шагов, и наш продвинутый ИИ-помощник составит для тебя "
-        f"индивидуальные рекомендации.",
+        f"Пройди опрос из 6 шагов или посмотри свои прошлые результаты с помощью меню ниже.",
         reply_markup=main_kb
     )
+
+
+# ХЕНДЛЕР ПРОСМОТРА ИСТОРИИ
+@router.message(F.text == "📜 История рекомендаций")
+async def show_history(message: Message):
+    user_id = message.from_user.id
+
+    # Проверяем, есть ли у пользователя сохраненные тесты
+    if user_id not in user_history or not user_history[user_id]:
+        await message.answer(
+            "У тебя пока нет сохраненной истории. Пройди анкетирование, чтобы ИИ составил первый трек! 📋",
+            reply_markup=main_kb
+        )
+        return
+
+    await message.answer("🔍 Загружаю твои прошлые рекомендации...")
+
+    # Выводим по очереди все сохраненные ответы ИИ для этого юзера
+    for index, past_recommendation in enumerate(user_history[user_id], 1):
+        await message.answer(
+            f"📅 **Вариант №{index}**\n\n{past_recommendation}",
+            reply_markup=main_kb
+        )
 
 
 @router.message(F.text == "📋 Начать анкетирование")
@@ -130,6 +170,9 @@ async def start_anketa(message: Message, state: FSMContext):
 
 @router.message(UserAnketa.interests)
 async def process_interests(message: Message, state: FSMContext):
+    if is_invalid_input(message.text):
+        await message.answer("Пожалуйста, введи нормальный ответ текстом (без спама символами и длинных слов).")
+        return
     await state.update_data(interests=message.text)
     await state.set_state(UserAnketa.subjects)
     await message.answer("Шаг 2 из 6. Какие твои любимые школьные предметы, курсы или дисциплины?")
@@ -137,6 +180,9 @@ async def process_interests(message: Message, state: FSMContext):
 
 @router.message(UserAnketa.subjects)
 async def process_subjects(message: Message, state: FSMContext):
+    if is_invalid_input(message.text):
+        await message.answer("Пожалуйста, введи нормальный ответ текстом без спама.")
+        return
     await state.update_data(subjects=message.text)
     await state.set_state(UserAnketa.goals)
     await message.answer(
@@ -145,6 +191,9 @@ async def process_subjects(message: Message, state: FSMContext):
 
 @router.message(UserAnketa.goals)
 async def process_goals(message: Message, state: FSMContext):
+    if is_invalid_input(message.text):
+        await message.answer("Пожалуйста, введи нормальный ответ текстом без спама.")
+        return
     await state.update_data(goals=message.text)
     await state.set_state(UserAnketa.employment)
     await message.answer("Шаг 4 из 6. Укажи желаемый уровень занятости:", reply_markup=employment_kb)
@@ -169,6 +218,7 @@ async def process_format(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(UserAnketa.difficulty)
 async def process_difficulty(callback: CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
     diff_val = callback.data.split("_")[1]
     await state.update_data(difficulty=diff_val)
     await callback.answer()
@@ -177,20 +227,25 @@ async def process_difficulty(callback: CallbackQuery, state: FSMContext):
     await state.clear()
 
     await callback.message.delete()
-    status_msg = await callback.message.answer("⏳ Модуль искусственного интеллекта анализирует ваши ответы...")
+    status_msg = await callback.message.answer("⏳ Наш искусственный интеллект формирует ваше персональное меню...")
     await bot.send_chat_action(chat_id=callback.message.chat.id, action="typing")
 
-    # === ТОЛЬКО ИИ ===
-    recommendations = await get_llm_recommendation(full_anketa)
+    is_retry = user_id in user_history
 
-    # Дополнительная ручная фильтрация текста от любых случайных символов markdown звездочек
+    recommendations = await get_llm_recommendation(full_anketa, is_retry)
     clean_recommendations = recommendations.replace("*", "")
+
+    if user_id not in user_history:
+        user_history[user_id] = [clean_recommendations]
+    else:
+        user_history[user_id].append(clean_recommendations)
 
     await status_msg.delete()
     await callback.message.answer(
-        f"📊 Рекомендации по твоей индивидуальной траектории:\n\n{clean_recommendations}",
+        f"📋 Ваше индивидуальное меню рекомендаций:\n\n{clean_recommendations}",
         reply_markup=main_kb
     )
+
 
 async def main():
     dp.include_router(router)
